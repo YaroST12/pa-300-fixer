@@ -1,5 +1,5 @@
 # Resolve-AMDMismatch.ps1
-# Detects and resolves AMD display driver and control panel version mismatches.
+# Detects and resolves AMD display driver mismatches, with Hardware ID blocking.
 
 $ErrorActionPreference = "Stop"
 
@@ -25,10 +25,13 @@ $activeDriver = $gpu.DriverVersion
 Write-Host "Detected GPU: $($gpu.Name)"
 Write-Host "Active Driver Version: $activeDriver"
 
+# Retrieve specific Hardware ID for policy blocking
+$pnpDevice = Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPDeviceID -eq $gpu.PNPDeviceID }
+$hardwareId = $pnpDevice.HardwareID[0]
+
 # 3. Registry Target Detection
 $regPath = "HKLM:\SOFTWARE\AMD\CN"
 $expectedDriver = "Unknown"
-$mismatchDetected = $false
 
 if (Test-Path $regPath) {
     $expectedDriverValue = (Get-ItemProperty -Path $regPath -Name "DriverVersion" -ErrorAction SilentlyContinue).DriverVersion
@@ -40,12 +43,14 @@ Write-Host "Control Panel Expects: $expectedDriver"
 
 if ($activeDriver -ne $expectedDriver -and $expectedDriver -ne "Unknown") {
     Write-Host "STATUS: MISMATCH DETECTED`n" -ForegroundColor Red
-    $mismatchDetected = $true
 } else {
     Write-Host "STATUS: NO MISMATCH DETECTED (or Control Panel not installed)`n" -ForegroundColor Green
+    Write-Host "System state is normal. No action required."
+    Read-Host "Press Enter to exit..."
+    exit
 }
 
-# 4. Manual Instruction Function (Colored)
+# 4. Manual Instruction Function
 function Show-ManualInstructions {
     param($GpuName, $Active, $Expected)
     
@@ -75,47 +80,34 @@ function Show-ManualInstructions {
 if (-not $isAdmin) {
     Show-ManualInstructions -GpuName $gpu.Name -Active $activeDriver -Expected $expectedDriver
     
-    $elevate = Read-Host "Would you like to restart this script as Administrator to enable automated fixes? [Y/N]"
+    $elevate = Read-Host "Would you like to restart this script as Administrator to enable automated fixes and blocks? [Y/N]"
     if ($elevate -match '^[Yy]') {
         Write-Host "Requesting elevation..." -ForegroundColor Cyan
         Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
     }
-    exit # Exits the non-elevated session regardless of choice
+    exit 
 }
 
-# 6. Conditional Prompt for Admins
-if (-not $mismatchDetected) {
-    $continueScan = Read-Host "No mismatch detected. Scan for drivers and show options anyway? [Y/N]"
-    if ($continueScan -notmatch '^[Yy]') {
-        Write-Host "Exiting."
-        Read-Host "Press Enter to exit..."
-        exit
-    }
-}
-
-# 7. Driver Store Interrogation
+# 6. Driver Store Interrogation
 Write-Host "Scanning Windows Driver Store for available AMD Display Drivers..."
 $driverStore = Get-WindowsDriver -Online | Where-Object { 
     ($_.ProviderName -match "Advanced Micro Devices" -or $_.ProviderName -match "AMD") -and 
     $_.ClassName -eq "Display" 
 }
 
-if (-not $driverStore) {
-    Write-Host "No cached AMD display drivers found in the driver store. Cannot automate rollback." -ForegroundColor Red
-    Show-ManualInstructions -GpuName $gpu.Name -Active $activeDriver -Expected $expectedDriver
-    Read-Host "Press Enter to exit..."
-    exit
+if ($driverStore) {
+    $sortedDrivers = $driverStore | Sort-Object -Property @{Expression={[version]$_.Version}; Descending=$true}
+    $newestDriver = $sortedDrivers | Select-Object -First 1
+    $oldestDriver = $sortedDrivers | Select-Object -Last 1
+
+    Write-Host "Found $($sortedDrivers.Count) cached AMD driver packages."
+    Write-Host " - Newest available: $($newestDriver.Version) ($($newestDriver.Driver))"
+    Write-Host " - Oldest available: $($oldestDriver.Version) ($($oldestDriver.Driver))`n"
+} else {
+    Write-Host "No cached AMD display drivers found in the driver store. Local driver switching is disabled.`n" -ForegroundColor Yellow
 }
 
-$sortedDrivers = $driverStore | Sort-Object -Property @{Expression={[version]$_.Version}; Descending=$true}
-$newestDriver = $sortedDrivers | Select-Object -First 1
-$oldestDriver = $sortedDrivers | Select-Object -Last 1
-
-Write-Host "Found $($sortedDrivers.Count) cached AMD driver packages."
-Write-Host " - Newest available: $($newestDriver.Version) ($($newestDriver.Driver))"
-Write-Host " - Oldest available: $($oldestDriver.Version) ($($oldestDriver.Driver))`n"
-
-# 8. Core Execution Function
+# 7. Execution Functions
 function Install-TargetDriver {
     param([PSCustomObject]$TargetDriverPackage, [string]$Expected)
     
@@ -140,9 +132,8 @@ function Install-TargetDriver {
         Write-Host "Pnputil returned exit code $($process.ExitCode). Driver update may have failed." -ForegroundColor Red
     }
 
-    # Double check state
     Write-Host "`n--- Post-Installation Verification ---" -ForegroundColor Cyan
-    Start-Sleep -Seconds 2 # Give WMI a moment to reflect changes
+    Start-Sleep -Seconds 2 
     $newGpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match "AMD|Radeon" }
     $newActive = $newGpu.DriverVersion
     
@@ -152,43 +143,52 @@ function Install-TargetDriver {
     if ($newActive -eq $Expected) {
         Write-Host "Result: SUCCESS (Versions match)" -ForegroundColor Green
     } elseif ($Expected -ne "Unknown" -and [version]$Expected -gt [version]$newActive) {
-        Write-Host "Result: OK (Control Panel is newer than active driver. Mismatch error should not appear.)" -ForegroundColor Green
+        Write-Host "Result: OK (Control Panel is newer than active driver)" -ForegroundColor Green
     } else {
         Write-Host "Result: MISMATCH STILL PRESENT" -ForegroundColor Red
     }
 }
 
-# 9. Interactive Menu
-$menuLoop = $true
-while ($menuLoop) {
-    Write-Host "`nSelect an action:" -ForegroundColor Cyan
-    Write-Host "[1] Automatically install the NEWEST driver version ($($newestDriver.Version))"
-    Write-Host "[2] Automatically install the OLDEST driver version ($($oldestDriver.Version))"
-    Write-Host "[3] Print manual resolution instructions"
-    Write-Host "[4] Exit"
-    
-    $selection = Read-Host "Enter option (1-4)"
-    
-    switch ($selection) {
-        '1' { 
-            Install-TargetDriver -TargetDriverPackage $newestDriver -Expected $expectedDriver
-            $menuLoop = $false
-        }
-        '2' { 
-            Install-TargetDriver -TargetDriverPackage $oldestDriver -Expected $expectedDriver
-            $menuLoop = $false
-        }
-        '3' { 
-            Show-ManualInstructions -GpuName $gpu.Name -Active $activeDriver -Expected $expectedDriver
-        }
-        '4' { 
-            Write-Host "Exiting."
-            $menuLoop = $false
-        }
-        default { 
-            Write-Host "Invalid selection." -ForegroundColor Yellow
-        }
+function Set-HardwareIdBlock {
+    param([string]$HwId)
+    $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions"
+    $listPath = "$policyPath\DenyDeviceIDs"
+
+    try {
+        if (-not (Test-Path $policyPath)) { New-Item -Path $policyPath -Force | Out-Null }
+        if (-not (Test-Path $listPath)) { New-Item -Path $listPath -Force | Out-Null }
+
+        Set-ItemProperty -Path $policyPath -Name "DenyDeviceIDs" -Value 1 -Type DWord
+        Set-ItemProperty -Path $policyPath -Name "DenyDeviceIDsRetroactive" -Value 0 -Type DWord
+        Set-ItemProperty -Path $listPath -Name "1" -Value $HwId -Type String
+        
+        Write-Host "`n[SUCCESS] Hardware ID Block Applied." -ForegroundColor Green
+        Write-Host "Blocked ID: $HwId"
+        Write-Host "Windows Update and manual installers are now prevented from updating this device." -ForegroundColor Yellow
+    } catch {
+        Write-Host "`n[ERROR] Failed to apply registry policies. $_" -ForegroundColor Red
     }
 }
 
-Read-Host "`nPress Enter to exit..."
+function Remove-HardwareIdBlock {
+    $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions"
+    
+    try {
+        if (Test-Path $policyPath) {
+            Set-ItemProperty -Path $policyPath -Name "DenyDeviceIDs" -Value 0 -Type DWord
+            Remove-Item -Path "$policyPath\DenyDeviceIDs" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "`n[SUCCESS] Hardware ID Block Removed." -ForegroundColor Green
+            Write-Host "You can now update the driver normally."
+        } else {
+            Write-Host "`n[INFO] No active restrictions found." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "`n[ERROR] Failed to remove registry policies. $_" -ForegroundColor Red
+    }
+}
+
+# 8. Interactive Menu
+$menuLoop = $true
+while ($menuLoop) {
+    Write-Host "`nSelect an action:" -ForegroundColor Cyan
+    if ($
