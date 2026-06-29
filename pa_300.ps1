@@ -8,7 +8,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 
 Write-Host "--- AMD Driver & Control Panel Diagnostic Tool ---" -ForegroundColor Cyan
 if (-not $isAdmin) {
-    Write-Host "Mode: Non-Administrator (Detection and Manual Guidance Only)" -ForegroundColor Yellow
+    Write-Host "Mode: Non-Administrator (Detection and Manual Guidance)" -ForegroundColor Yellow
 } else {
     Write-Host "Mode: Administrator (Full Automation Available)" -ForegroundColor Green
 }
@@ -17,6 +17,7 @@ if (-not $isAdmin) {
 $gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match "AMD|Radeon" }
 if (-not $gpu) {
     Write-Host "No AMD GPU detected on this system. Exiting." -ForegroundColor Red
+    Read-Host "Press Enter to exit..."
     exit
 }
 
@@ -70,11 +71,16 @@ function Show-ManualInstructions {
     Write-Host "====================================================================`n" -ForegroundColor Cyan
 }
 
-# 5. Non-Admin Handling
+# 5. Non-Admin Handling & Self-Escalation
 if (-not $isAdmin) {
     Show-ManualInstructions -GpuName $gpu.Name -Active $activeDriver -Expected $expectedDriver
-    Write-Host "Restart script as Administrator to enable automated driver rollback." -ForegroundColor Yellow
-    exit
+    
+    $elevate = Read-Host "Would you like to restart this script as Administrator to enable automated fixes? [Y/N]"
+    if ($elevate -match '^[Yy]') {
+        Write-Host "Requesting elevation..." -ForegroundColor Cyan
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    }
+    exit # Exits the non-elevated session regardless of choice
 }
 
 # 6. Conditional Prompt for Admins
@@ -82,6 +88,7 @@ if (-not $mismatchDetected) {
     $continueScan = Read-Host "No mismatch detected. Scan for drivers and show options anyway? [Y/N]"
     if ($continueScan -notmatch '^[Yy]') {
         Write-Host "Exiting."
+        Read-Host "Press Enter to exit..."
         exit
     }
 }
@@ -96,6 +103,7 @@ $driverStore = Get-WindowsDriver -Online | Where-Object {
 if (-not $driverStore) {
     Write-Host "No cached AMD display drivers found in the driver store. Cannot automate rollback." -ForegroundColor Red
     Show-ManualInstructions -GpuName $gpu.Name -Active $activeDriver -Expected $expectedDriver
+    Read-Host "Press Enter to exit..."
     exit
 }
 
@@ -153,7 +161,7 @@ function Install-TargetDriver {
 # 9. Interactive Menu
 $menuLoop = $true
 while ($menuLoop) {
-    Write-Host "Select an action:" -ForegroundColor Cyan
+    Write-Host "`nSelect an action:" -ForegroundColor Cyan
     Write-Host "[1] Automatically install the NEWEST driver version ($($newestDriver.Version))"
     Write-Host "[2] Automatically install the OLDEST driver version ($($oldestDriver.Version))"
     Write-Host "[3] Print manual resolution instructions"
@@ -182,3 +190,5 @@ while ($menuLoop) {
         }
     }
 }
+
+Read-Host "`nPress Enter to exit..."
